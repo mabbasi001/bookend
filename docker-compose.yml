@@ -1,0 +1,47 @@
+# Usage:
+#   docker compose up --build                     # paper (default)
+#   MM_MODE=testnet docker compose up --build     # testnet
+#   MM_MODE=live ENABLE_LIVE_TRADING=true docker compose up --build   # live — read README first
+#
+# Secrets come from .env (see .env.example). Never bake them into the image.
+
+services:
+  bookend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bookend:local
+    container_name: bookend
+    env_file:
+      - path: .env
+        required: false     # paper mode needs no secrets
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      # Only forwarded when set on the host; absent in paper/testnet by default.
+      ENABLE_LIVE_TRADING: ${ENABLE_LIVE_TRADING:-}
+    command: ["--config", "/app/configs/${MM_MODE:-paper}.toml"]
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+    # Shutdown sequence: stop strategy → cancel all open orders → wait for
+    # confirmations → persist state. Give it time before SIGKILL.
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    restart: unless-stopped
+    init: false            # binary is PID 1 on purpose (see Dockerfile)
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

@@ -1,0 +1,60 @@
+# Paper mode: real Binance market data, simulated execution, no credentials required.
+
+[bot]
+name  = "bookend-btc"
+mode  = "paper"
+base  = "BTC"
+quote = "USDT"
+
+[exchanges.binance]
+enabled        = true
+api_key_env    = "BINANCE_API_KEY"      # unused in paper mode
+api_secret_env = "BINANCE_API_SECRET"
+
+[exchanges.bybit]
+enabled = false
+
+[exchanges.okx]
+enabled = false
+
+[strategy]
+name       = "basic_mm"
+spread_bps = 100
+order_size = "0.01"
+post_only  = true
+
+[strategy.fair_price]
+method = "local_mid"
+
+[strategy.inventory]
+target_ratio = 0.50
+skew_factor  = 0.50
+
+[strategy.levels]
+count       = 1
+spacing_bps = 50
+
+[quote]
+refresh_interval_ms  = 500
+min_price_change_bps = 5
+min_quantity_change  = "0.001"
+
+[risk]
+max_order_size         = "0.1"
+max_position           = "10"
+max_open_orders        = 20
+min_inventory_ratio    = 0.20
+max_inventory_ratio    = 0.80
+max_daily_loss         = "5000"
+max_market_data_age_ms = 2000
+
+[fees]
+maker_bps = 10
+taker_bps = 20
+
+[persistence]
+path = "data/state.json"
+
+[logging]
+level  = "info"
+format = "json"
