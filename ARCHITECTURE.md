@@ -85,31 +85,7 @@ Single crate. Split into a workspace only if adapter compile times become a prob
 
 ### Cargo.toml
 
-```toml
-[package]
-name    = "bookend"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-tokio              = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
-reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio-tungstenite  = { version = "0.27", features = ["rustls-tls-native-roots"] }
-serde              = { version = "1", features = ["derive"] }
-serde_json         = "1"
-toml               = "0.9"
-tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-thiserror          = "2"
-anyhow             = "1"
-uuid               = { version = "1", features = ["v4", "serde"] }
-chrono             = { version = "0.4", features = ["serde"] }
-rust_decimal       = { version = "1", features = ["serde"] }
-async-trait        = "0.1"
-clap               = { version = "4", features = ["derive", "env"] }
-```
-
-Inline tables must stay on one line (TOML 1.0). Check versions when implementation starts.
+See the real [`Cargo.toml`](Cargo.toml). Notes: `reqwest` ≥ 0.13 uses rustls by default (`json`, `query` features added); `tokio-util` provides `CancellationToken`; inline tables stay on one line.
 
 ---
 
