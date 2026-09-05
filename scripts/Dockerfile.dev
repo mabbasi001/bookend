@@ -1,0 +1,7 @@
+# Dev toolchain image for scripts/cargo.sh: official slim image + clippy + rustfmt.
+ARG RUST_IMAGE=rust:1-slim-bookworm
+FROM ${RUST_IMAGE}
+RUN rustup component add clippy rustfmt \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends pkg-config ca-certificates \
+ && rm -rf /var/lib/apt/lists/*

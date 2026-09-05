@@ -95,6 +95,8 @@ cp .env.example .env            # fill in API keys (not needed for paper mode)
 cargo run -- --config configs/paper.toml
 ```
 
+No local Rust toolchain? `scripts/cargo.sh` runs the same commands inside the official `rust` image (with clippy and rustfmt), e.g. `scripts/cargo.sh test`, `scripts/cargo.sh clippy -- -D warnings`.
+
 ### Docker
 
 ```bash
