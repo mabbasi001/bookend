@@ -105,7 +105,7 @@ docker compose up --build                 # paper mode (default)
 MM_MODE=testnet docker compose up --build # testnet
 ```
 
-The image is a two-stage build (`rust:slim` → `debian:slim`, non-root, ~40 MB). Configs are mounted read-only from `./configs`, persistent state is written to `./data`. `RUST_LOG` controls log level; logs go to stdout as JSON.
+The image is a two-stage build (`rust:slim` + cargo-chef → `debian:slim`, non-root, ~130 MB). Configs are mounted read-only from `./configs`, persistent state is written to `./data`. `RUST_LOG` controls log level; logs go to stdout as JSON.
 
 Live mode additionally requires `ENABLE_LIVE_TRADING=true` in the environment and `MM_MODE=live`. `stop_grace_period` is set to 30 s so the engine can cancel open orders on `SIGTERM` before the container is killed — do not lower it.
 

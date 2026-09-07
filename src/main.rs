@@ -1,32 +1,13 @@
-//! Bookend — exchange-agnostic market-making engine.
-//!
-//! Entry point: parse the CLI, load and validate config, initialise logging,
-//! enforce the live-trading gate, then hand over to [`bot::Bot`].
-
-// Most of the domain model is defined ahead of the code that uses it.
-// TODO: remove once M3 (paper market maker) wires everything together.
-#![allow(dead_code)]
-
-mod bot;
-mod config;
-mod events;
-mod exchange;
-mod logging;
-mod market_data;
-mod orders;
-mod persistence;
-mod portfolio;
-mod quote;
-mod risk;
-mod strategy;
-mod types;
+//! CLI entry point: parse args, load and validate config, initialise logging,
+//! enforce the live-trading gate, then hand over to [`Bot`].
 
 use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::bot::Bot;
-use crate::config::{Config, Mode};
+use bookend::bot::{self, Bot};
+use bookend::config::{Config, Mode};
+use bookend::logging;
 
 #[derive(Parser, Debug)]
 #[command(name = "bookend", version, about = "Exchange-agnostic market-making engine")]

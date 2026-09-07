@@ -1,6 +1,8 @@
 //! The exchange abstraction. Adapters live in submodules and are the only code
 //! that knows an exchange's API.
 
+pub mod binance;
+
 use std::time::Duration;
 
 use async_trait::async_trait;
