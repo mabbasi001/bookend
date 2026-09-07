@@ -163,6 +163,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "futures-util",
  "reqwest",
  "rust_decimal",
  "serde",
