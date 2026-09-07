@@ -38,3 +38,40 @@ async fn unknown_symbol_is_an_invalid_order_error() {
     eprintln!("{err}");
     assert!(matches!(err, bookend::exchange::ExchangeError::InvalidOrder(_)), "{err}");
 }
+
+#[tokio::test]
+#[ignore = "needs network"]
+async fn depth_stream_stays_in_sequence_for_20_books() {
+    use bookend::events::MarketEvent;
+    use std::time::Duration;
+
+    let ex = BinanceExchange::new(Mode::Paper, None).unwrap();
+    let mut rx = ex.subscribe_market_data(&Symbol::new("BTC", "USDT")).await.unwrap();
+
+    let mut last_seq = 0;
+    let mut books = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while books < 20 {
+        let ev = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("stream stalled")
+            .expect("stream ended");
+        match ev {
+            MarketEvent::Book(b) => {
+                assert!(
+                    b.sequence > last_seq,
+                    "sequence went backwards: {} -> {}",
+                    last_seq,
+                    b.sequence
+                );
+                assert!(b.best_bid().unwrap().price < b.best_ask().unwrap().price, "crossed book");
+                assert_eq!(b.bids.len(), 20);
+                last_seq = b.sequence;
+                books += 1;
+            }
+            MarketEvent::Disconnected(_) => panic!("disconnected during sync test"),
+            MarketEvent::Connected(_) | MarketEvent::Trade(_) => {}
+        }
+    }
+    eprintln!("{books} books in sequence, last seq {last_seq}");
+}

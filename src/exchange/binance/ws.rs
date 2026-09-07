@@ -35,6 +35,9 @@ const PUBLISH_DEPTH: usize = 20;
 /// levels keep the book consistent.
 const SNAPSHOT_LIMIT: u16 = 1000;
 const CHANNEL_CAPACITY: usize = 256;
+/// `depth@100ms` never goes quiet and Binance pings every 20 s; silence this
+/// long means the TCP connection is dead (e.g. network cut without RST).
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
@@ -215,6 +218,8 @@ enum SessionError {
     Ws(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("stream closed by server")]
     Closed,
+    #[error("no message for {0:?}; connection presumed dead")]
+    Idle(Duration),
     #[error("snapshot: {0}")]
     Snapshot(ExchangeError),
     #[error("decode: {0}")]
@@ -244,11 +249,12 @@ async fn run_session(
 
     loop {
         tokio::select! {
-            msg = stream.next() => {
+            msg = tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next()) => {
                 let msg = match msg {
-                    Some(Ok(m)) => m,
-                    Some(Err(e)) => return Err(e.into()),
-                    None => return Err(SessionError::Closed),
+                    Ok(Some(Ok(m))) => m,
+                    Ok(Some(Err(e))) => return Err(e.into()),
+                    Ok(None) => return Err(SessionError::Closed),
+                    Err(_) => return Err(SessionError::Idle(READ_IDLE_TIMEOUT)),
                 };
                 match msg {
                     Message::Text(text) => {

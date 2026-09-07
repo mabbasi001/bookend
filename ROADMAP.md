@@ -8,8 +8,8 @@ Skeleton → Binance market data → Paper MM → Binance testnet → Risk → B
 
 | # | Milestone | Deliverable | Done when |
 |---|---|---|---|
-| 1 | Skeleton | Cargo project, config, logging, domain types, `Exchange` trait, Docker build | `cargo run -- --config configs/paper.toml` starts and exits cleanly on Ctrl-C |
-| 2 | Binance market data | REST + WS adapter, order-book sync, `MarketInfo`, staleness | live `BTC/USDT` best bid/ask/mid printed continuously, survives a forced disconnect |
+| 1 | Skeleton ✅ | Cargo project, config, logging, domain types, `Exchange` trait, Docker build | `cargo run -- --config configs/paper.toml` starts and exits cleanly on Ctrl-C |
+| 2 | Binance market data ✅ | REST + WS adapter, order-book sync, `MarketInfo`, staleness | live `BTC/USDT` best bid/ask/mid printed continuously, survives a forced disconnect |
 | 3 | Paper market maker | fair price, spread, quotes, `PaperExchange` fills, inventory, PnL, persistence | bot runs for hours in paper mode with sane PnL/inventory logs |
 | 4 | Binance testnet | place/cancel/query, user stream, balances, reconciliation, client ids | real orders on testnet; restart mid-run reconciles correctly |
 | 5 | Risk | all `[risk]` limits, kill switch, automatic kill conditions | every limit has a test that trips it; kill switch cancels everything |
