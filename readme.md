@@ -181,6 +181,10 @@ max_market_data_age_ms = 2000
 maker_bps = 10
 taker_bps = 20
 
+[paper]                     # simulated account, paper mode only
+initial_base  = "0.5"
+initial_quote = "50000"
+
 [persistence]
 path = "data/state.json"
 

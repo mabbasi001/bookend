@@ -2,6 +2,7 @@
 //! that knows an exchange's API.
 
 pub mod binance;
+pub mod paper;
 
 use std::time::Duration;
 

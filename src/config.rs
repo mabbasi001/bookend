@@ -242,6 +242,22 @@ impl Default for FeesConfig {
     }
 }
 
+/// Simulated account for `paper` mode.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaperConfig {
+    /// Starting base-asset balance.
+    pub initial_base: Decimal,
+    /// Starting quote-asset balance.
+    pub initial_quote: Decimal,
+}
+
+impl Default for PaperConfig {
+    fn default() -> Self {
+        Self { initial_base: Decimal::ZERO, initial_quote: Decimal::from(10_000) }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistenceConfig {
@@ -300,6 +316,8 @@ pub struct Config {
     pub risk: RiskConfig,
     #[serde(default)]
     pub fees: FeesConfig,
+    #[serde(default)]
+    pub paper: PaperConfig,
     #[serde(default)]
     pub persistence: PersistenceConfig,
     #[serde(default)]
@@ -466,6 +484,10 @@ impl Config {
                 "inventory ratios must satisfy 0 < risk.min ({}) < strategy.target ({}) < risk.max ({}) < 1",
                 r.min_inventory_ratio, t, r.max_inventory_ratio
             ));
+        }
+
+        if self.paper.initial_base < zero || self.paper.initial_quote < zero {
+            return invalid("paper.initial_base / initial_quote must be >= 0".into());
         }
 
         if self.logging.level.trim().is_empty() {

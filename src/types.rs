@@ -154,11 +154,66 @@ pub struct MarketInfo {
     pub min_notional: Decimal,
 }
 
+impl MarketInfo {
+    /// Largest multiple of `price_tick` that is `<= price`.
+    pub fn round_price_down(&self, price: Decimal) -> Decimal {
+        round_down(price, self.price_tick)
+    }
+
+    /// Smallest multiple of `price_tick` that is `>= price`.
+    pub fn round_price_up(&self, price: Decimal) -> Decimal {
+        round_up(price, self.price_tick)
+    }
+
+    /// Largest multiple of `quantity_step` that is `<= quantity`.
+    pub fn round_quantity_down(&self, quantity: Decimal) -> Decimal {
+        round_down(quantity, self.quantity_step)
+    }
+
+    pub fn is_price_aligned(&self, price: Decimal) -> bool {
+        (price / self.price_tick).fract().is_zero()
+    }
+
+    pub fn is_quantity_aligned(&self, quantity: Decimal) -> bool {
+        (quantity / self.quantity_step).fract().is_zero()
+    }
+
+    /// Both size constraints hold for this (price, quantity).
+    pub fn meets_minimums(&self, price: Decimal, quantity: Decimal) -> bool {
+        quantity >= self.min_quantity && price * quantity >= self.min_notional
+    }
+}
+
+pub fn round_down(value: Decimal, step: Decimal) -> Decimal {
+    if step.is_zero() {
+        return value;
+    }
+    ((value / step).floor() * step).normalize()
+}
+
+pub fn round_up(value: Decimal, step: Decimal) -> Decimal {
+    if step.is_zero() {
+        return value;
+    }
+    ((value / step).ceil() * step).normalize()
+}
+
 /// Fee tier in basis points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fees {
     pub maker_bps: Decimal,
     pub taker_bps: Decimal,
+}
+
+impl Fees {
+    pub fn from_bps(maker_bps: u32, taker_bps: u32) -> Self {
+        Self { maker_bps: Decimal::from(maker_bps), taker_bps: Decimal::from(taker_bps) }
+    }
+
+    /// Maker fee on a notional amount.
+    pub fn maker_fee(&self, notional: Decimal) -> Decimal {
+        notional * self.maker_bps / Decimal::from(10_000)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +379,30 @@ mod tests {
     fn mid_is_none_on_one_sided_book() {
         assert!(book(&[("1", "1")], &[]).mid().is_none());
         assert!(book(&[], &[]).mid().is_none());
+    }
+
+    #[test]
+    fn rounding_to_tick_and_step() {
+        let m = MarketInfo {
+            symbol: Symbol::new("BTC", "USDT"),
+            native_symbol: "BTCUSDT".into(),
+            price_tick: "0.01".parse().unwrap(),
+            quantity_step: "0.001".parse().unwrap(),
+            min_quantity: "0.01".parse().unwrap(),
+            min_notional: "5".parse().unwrap(),
+        };
+        let d = |s: &str| s.parse::<Decimal>().unwrap();
+        assert_eq!(m.round_price_down(d("1.2345")), d("1.23"));
+        assert_eq!(m.round_price_up(d("1.2345")), d("1.24"));
+        assert_eq!(m.round_price_up(d("1.23")), d("1.23"), "already aligned stays");
+        assert_eq!(m.round_quantity_down(d("0.12399")), d("0.123"));
+        assert!(m.is_price_aligned(d("1.23")) && !m.is_price_aligned(d("1.234")));
+        assert!(m.is_quantity_aligned(d("0.5")) && !m.is_quantity_aligned(d("0.0005")));
+        assert!(m.meets_minimums(d("100"), d("0.05")));
+        assert!(!m.meets_minimums(d("100"), d("0.001")), "below min qty");
+        assert!(!m.meets_minimums(d("1"), d("0.5")), "below min notional");
+        assert_eq!(round_down(d("7"), Decimal::ZERO), d("7"), "zero step is identity");
+        assert_eq!(Fees::from_bps(10, 20).maker_fee(d("1000")), d("1"));
     }
 
     #[test]

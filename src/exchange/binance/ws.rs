@@ -336,7 +336,7 @@ impl Backoff {
     pub fn next_delay(&mut self) -> Duration {
         let base = self.current;
         self.current = (self.current * 2).min(self.max);
-        let jitter_pct = (chrono::Utc::now().timestamp_subsec_nanos() % 26) as u32;
+        let jitter_pct = chrono::Utc::now().timestamp_subsec_nanos() % 26;
         base + base * jitter_pct / 100
     }
 }
