@@ -10,6 +10,16 @@
 //!
 //! [`DepthSync`] is the pure state machine (unit-tested); [`run_stream`] is
 //! the I/O loop around it.
+//!
+//! The private user data stream lives here too. Binance withdrew the REST
+//! listen-key endpoints (they answer `410 Gone`), so the stream is opened on
+//! the WebSocket API with `userDataStream.subscribe.signature`: one signed
+//! request per connection, after which events are pushed down the same socket.
+//! There is no key to keep alive, but the connection is capped at 24 hours, so
+//! it still re-subscribes on every reconnect.
+//!
+//! `session.logon` is not an option here: it accepts Ed25519 keys only, and
+//! this adapter signs with HMAC-SHA256.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,10 +31,11 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
+use super::SymbolRegistry;
 use super::client::BinanceClient;
 use super::mapper;
-use super::rest::{self, DepthSnapshot, DepthUpdate};
-use crate::events::MarketEvent;
+use super::rest::{self, DepthSnapshot, DepthUpdate, UserStreamEvent, WsApiFrame};
+use crate::events::{MarketEvent, UserEvent};
 use crate::exchange::ExchangeError;
 use crate::market_data::orderbook::LocalBook;
 use crate::types::{ExchangeId, OrderBook, Symbol};
@@ -40,6 +51,11 @@ const CHANNEL_CAPACITY: usize = 256;
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// The user stream is silent on a quiet account, so only Binance's own
+/// 3-minute pings bound the idle time. Two missed pings means it is dead.
+const USER_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(7 * 60);
+/// Request id for the subscribe call; one per connection.
+const SUBSCRIBE_REQUEST_ID: &str = "bookend-user-stream";
 
 // ---------------------------------------------------------------------------
 // Sync state machine
@@ -224,6 +240,8 @@ enum SessionError {
     Snapshot(ExchangeError),
     #[error("decode: {0}")]
     Decode(#[from] serde_json::Error),
+    #[error("user stream subscribe rejected: status {status} {message}")]
+    Subscribe { status: u16, message: String },
 }
 
 /// One connection: returns `Ok(())` only when the consumer is gone.
@@ -311,6 +329,213 @@ async fn run_session(
 
 async fn publish(tx: &mpsc::Sender<MarketEvent>, sync: &DepthSync) -> Result<(), ()> {
     tx.send(MarketEvent::Book(Arc::new(sync.snapshot()))).await.map_err(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// User data stream
+// ---------------------------------------------------------------------------
+
+/// Opens the stream once before returning, so bad or unpermissioned
+/// credentials fail startup instead of looping in a background task.
+pub async fn subscribe_user_events(
+    client: BinanceClient,
+    symbols: SymbolRegistry,
+) -> Result<mpsc::Receiver<UserEvent>, ExchangeError> {
+    let session = connect_user_stream(&client).await.map_err(|e| match e {
+        SessionError::Subscribe { status: 401 | 403, .. } => ExchangeError::Authentication,
+        other => ExchangeError::Unknown(format!("user stream: {other}")),
+    })?;
+    let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+    tokio::spawn(run_user_stream(client, symbols, session, tx));
+    Ok(rx)
+}
+
+type UserSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Connect to the WebSocket API and subscribe; the returned socket is live.
+async fn connect_user_stream(client: &BinanceClient) -> Result<UserSocket, SessionError> {
+    let url = client.endpoints().ws_api;
+    info!(exchange = "binance", %url, "connecting user stream");
+    let (mut ws, _) = connect_async(url).await?;
+
+    // The request carries the signature, so it is never logged.
+    let params = client
+        .ws_api_signed_params()
+        .map_err(|e| SessionError::Subscribe { status: 401, message: e.to_string() })?;
+    let request = serde_json::json!({
+        "id": SUBSCRIBE_REQUEST_ID,
+        "method": "userDataStream.subscribe.signature",
+        "params": params,
+    });
+    ws.send(Message::Text(request.to_string().into())).await?;
+
+    // Events can already be in flight; read until our reply arrives.
+    loop {
+        let msg = match tokio::time::timeout(USER_READ_IDLE_TIMEOUT, ws.next()).await {
+            Ok(Some(Ok(m))) => m,
+            Ok(Some(Err(e))) => return Err(e.into()),
+            Ok(None) => return Err(SessionError::Closed),
+            Err(_) => return Err(SessionError::Idle(USER_READ_IDLE_TIMEOUT)),
+        };
+        let Message::Text(text) = msg else { continue };
+        if let WsApiFrame::Reply(reply) = serde_json::from_str(text.as_str())? {
+            if reply.status != 200 {
+                let message = reply
+                    .error
+                    .map_or_else(|| "no detail".to_owned(), |e| format!("{}: {}", e.code, e.msg));
+                return Err(SessionError::Subscribe { status: reply.status, message });
+            }
+            debug!(exchange = "binance", "user stream subscribed");
+            return Ok(ws);
+        }
+        // A pushed event before the reply: dropped, since the caller is not
+        // listening yet. Only ever the tail of an already-known state.
+    }
+}
+
+/// Reconnect forever (with backoff) until the consumer drops the receiver.
+async fn run_user_stream(
+    client: BinanceClient,
+    symbols: SymbolRegistry,
+    first_session: UserSocket,
+    tx: mpsc::Sender<UserEvent>,
+) {
+    let mut backoff = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+    let mut session = Some(first_session);
+    loop {
+        let ws = match session.take() {
+            Some(ws) => ws,
+            None => match connect_user_stream(&client).await {
+                Ok(ws) => {
+                    backoff.reset();
+                    ws
+                }
+                Err(e) => {
+                    warn!(exchange = "binance", error = %e, "cannot open the user stream");
+                    tokio::time::sleep(backoff.next_delay()).await;
+                    continue;
+                }
+            },
+        };
+
+        match run_user_session(&symbols, ws, &tx).await {
+            Ok(()) => {
+                debug!(exchange = "binance", "user event consumer gone; stream task exiting");
+                return;
+            }
+            Err(e) => {
+                warn!(exchange = "binance", error = %e, "user stream session ended");
+                let delay = backoff.next_delay();
+                info!(
+                    exchange = "binance",
+                    delay_ms = delay.as_millis() as u64,
+                    "reconnecting user stream"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// One connection: returns `Ok(())` only when the consumer is gone.
+async fn run_user_session(
+    symbols: &SymbolRegistry,
+    ws: UserSocket,
+    tx: &mpsc::Sender<UserEvent>,
+) -> Result<(), SessionError> {
+    let (mut sink, mut stream) = ws.split();
+    loop {
+        let msg = match tokio::time::timeout(USER_READ_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(Ok(m))) => m,
+            Ok(Some(Err(e))) => return Err(e.into()),
+            Ok(None) => return Err(SessionError::Closed),
+            Err(_) => return Err(SessionError::Idle(USER_READ_IDLE_TIMEOUT)),
+        };
+        match msg {
+            Message::Text(text) => {
+                match serde_json::from_str::<WsApiFrame>(text.as_str())? {
+                    WsApiFrame::Push(push) => {
+                        if !dispatch(symbols, push.event, tx).await {
+                            return Ok(());
+                        }
+                    }
+                    // Nothing else is requested on this socket, so a reply here
+                    // is the server reporting something about the subscription.
+                    WsApiFrame::Reply(reply) if reply.status != 200 => {
+                        let message = reply.error.map_or_else(
+                            || "no detail".to_owned(),
+                            |e| format!("{}: {}", e.code, e.msg),
+                        );
+                        return Err(SessionError::Subscribe { status: reply.status, message });
+                    }
+                    WsApiFrame::Reply(_) => {}
+                }
+            }
+            Message::Ping(payload) => sink.send(Message::Pong(payload)).await?,
+            Message::Close(frame) => {
+                debug!(exchange = "binance", ?frame, "user stream close frame");
+                return Err(SessionError::Closed);
+            }
+            Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+        }
+    }
+}
+
+/// Forwards one user data event. `false` means the consumer is gone.
+async fn dispatch(
+    symbols: &SymbolRegistry,
+    event: UserStreamEvent,
+    tx: &mpsc::Sender<UserEvent>,
+) -> bool {
+    match event {
+        UserStreamEvent::ExecutionReport(report) => {
+            // Account-wide stream: orders on other symbols are not ours to track.
+            let Some(symbol) = symbols.resolve(&report.symbol) else {
+                debug!(
+                    exchange = "binance",
+                    symbol = %report.symbol,
+                    "execution report for an untracked symbol; ignored"
+                );
+                return true;
+            };
+            if report.status == "REJECTED" {
+                warn!(
+                    exchange = "binance",
+                    client_order_id = %report.client_order_id,
+                    reason = %report.reject_reason,
+                    "order rejected"
+                );
+            }
+            // One unreadable report must not tear down the connection.
+            match mapper::user_events(&symbol, &report) {
+                Ok(events) => {
+                    for event in events {
+                        if tx.send(event).await.is_err() {
+                            return false;
+                        }
+                    }
+                }
+                Err(e) => warn!(exchange = "binance", error = %e, "unusable execution report"),
+            }
+        }
+        UserStreamEvent::AccountPosition(position) => {
+            for balance in mapper::stream_balances(&position) {
+                if tx.send(UserEvent::Balance(balance)).await.is_err() {
+                    return false;
+                }
+            }
+        }
+        // A delta, not a total; `outboundAccountPosition` follows with the truth.
+        UserStreamEvent::BalanceUpdate(update) => debug!(
+            exchange = "binance",
+            asset = %update.asset,
+            delta = %update.delta,
+            "balance delta"
+        ),
+        UserStreamEvent::Other => {}
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------

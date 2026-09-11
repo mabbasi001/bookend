@@ -22,6 +22,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// well inside it.
 pub const RECV_WINDOW_MS: u64 = 5_000;
 const API_KEY_HEADER: HeaderName = HeaderName::from_static("x-mbx-apikey");
+/// "Timestamp for this request is outside of the recvWindow." Binance
+/// rejects the request before processing it, so nothing was placed and a
+/// retry with a corrected clock cannot duplicate an order.
+pub const CLOCK_SKEW_CODE: i64 = -1021;
 
 /// Lowercase-hex HMAC-SHA256 of `payload` keyed with the API secret — the
 /// Binance signature scheme (`signature=` over the exact query string).
@@ -44,13 +48,23 @@ enum Auth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Endpoints {
     pub rest: &'static str,
+    /// Public market data streams.
     pub ws: &'static str,
+    /// WebSocket API, which is the only way to open a user data stream since
+    /// the REST listen-key endpoints were withdrawn.
+    pub ws_api: &'static str,
 }
 
-pub const PROD: Endpoints =
-    Endpoints { rest: "https://api.binance.com", ws: "wss://stream.binance.com:9443" };
-pub const TESTNET: Endpoints =
-    Endpoints { rest: "https://testnet.binance.vision", ws: "wss://stream.testnet.binance.vision" };
+pub const PROD: Endpoints = Endpoints {
+    rest: "https://api.binance.com",
+    ws: "wss://stream.binance.com:9443",
+    ws_api: "wss://ws-api.binance.com:443/ws-api/v3",
+};
+pub const TESTNET: Endpoints = Endpoints {
+    rest: "https://testnet.binance.vision",
+    ws: "wss://stream.testnet.binance.vision",
+    ws_api: "wss://ws-api.testnet.binance.vision/ws-api/v3",
+};
 
 /// Production credentials must never be usable in paper/testnet: the mode
 /// alone decides the endpoints.
@@ -110,14 +124,37 @@ impl BinanceClient {
         self.inner.time_offset_ms.load(Ordering::Relaxed)
     }
 
-    /// Record `server_time - local_now` so signed requests carry a timestamp
+    /// Record `server_time - local_time` so signed requests carry a timestamp
     /// Binance accepts even when the host clock drifts.
-    pub fn set_server_time(&self, server_time_ms: i64) {
-        let offset = server_time_ms - chrono::Utc::now().timestamp_millis();
+    ///
+    /// `sent_at_ms` is the local clock when the request went out. The server
+    /// stamped its reply somewhere in between, so the offset is measured
+    /// against the midpoint of the round trip rather than against arrival,
+    /// which would charge the whole return leg to the offset.
+    pub fn set_server_time(&self, server_time_ms: i64, sent_at_ms: i64) {
+        let received_at = chrono::Utc::now().timestamp_millis();
+        let offset = server_time_ms - (sent_at_ms + received_at) / 2;
         if offset.abs() > 1_000 {
-            warn!(offset_ms = offset, "binance server time differs from local clock");
+            warn!(
+                offset_ms = offset,
+                rtt_ms = received_at - sent_at_ms,
+                "binance server time differs from local clock"
+            );
         }
         self.inner.time_offset_ms.store(offset, Ordering::Relaxed);
+    }
+
+    /// Re-measure the clock offset against `GET /api/v3/time`.
+    pub async fn sync_server_time(&self) -> Result<(), ExchangeError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ServerTime {
+            server_time: i64,
+        }
+        let sent_at = chrono::Utc::now().timestamp_millis();
+        let time: ServerTime = self.get_public("/api/v3/time", &[]).await?;
+        self.set_server_time(time.server_time, sent_at);
+        Ok(())
     }
 
     /// Unauthenticated GET with query parameters.
@@ -170,6 +207,9 @@ impl BinanceClient {
         self.request(method, path, params, Auth::Key).await
     }
 
+    /// A clock that has drifted since the last sync is retried once: the
+    /// exchange rejected the request outright, so re-sending it after
+    /// re-measuring the offset cannot duplicate anything.
     async fn request<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -177,10 +217,31 @@ impl BinanceClient {
         params: &[(&str, String)],
         auth: Auth,
     ) -> Result<T, ExchangeError> {
-        let creds = self.inner.credentials.as_ref().ok_or(ExchangeError::Authentication)?;
+        match self.send(method.clone(), path, params, auth).await {
+            Err((_, Some(CLOCK_SKEW_CODE))) => {
+                warn!(path, "binance rejected our timestamp; resyncing the clock");
+                self.sync_server_time().await?;
+                self.send(method, path, params, auth).await.map_err(|(e, _)| e)
+            }
+            other => other.map_err(|(e, _)| e),
+        }
+    }
+
+    /// One attempt. The Binance error code comes back alongside the mapped
+    /// error so the caller can tell a clock rejection from a real one.
+    async fn send<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        params: &[(&str, String)],
+        auth: Auth,
+    ) -> Result<T, (ExchangeError, Option<i64>)> {
+        let plain = |e: ExchangeError| (e, None);
+        let creds =
+            self.inner.credentials.as_ref().ok_or(ExchangeError::Authentication).map_err(plain)?;
         let query = match auth {
             Auth::Key => encode_query(params),
-            Auth::Signed => self.signed_query(params)?,
+            Auth::Signed => self.signed_query(params).map_err(plain)?,
         };
         // Every parameter travels in the query string for all methods; Binance
         // accepts that for POST/DELETE and it keeps one signing path. The
@@ -192,7 +253,7 @@ impl BinanceClient {
         headers.insert(
             API_KEY_HEADER,
             HeaderValue::from_str(creds.api_key.expose())
-                .map_err(|_| ExchangeError::Authentication)?,
+                .map_err(|_| plain(ExchangeError::Authentication))?,
         );
         let resp = self
             .inner
@@ -201,8 +262,25 @@ impl BinanceClient {
             .headers(headers)
             .send()
             .await
-            .map_err(map_transport)?;
-        decode(resp).await
+            .map_err(|e| plain(map_transport(e)))?;
+        decode_with_code(resp).await
+    }
+
+    /// Authentication for a WebSocket API request: `apiKey` and `timestamp`,
+    /// signed over the parameters sorted by name. That differs from REST,
+    /// which signs the query string exactly as sent.
+    pub fn ws_api_signed_params(&self) -> Result<serde_json::Value, ExchangeError> {
+        let creds = self.inner.credentials.as_ref().ok_or(ExchangeError::Authentication)?;
+        let api_key = creds.api_key.expose();
+        let timestamp = chrono::Utc::now().timestamp_millis() + self.time_offset_ms();
+        // Sorted by name: "apiKey" < "timestamp".
+        let payload = format!("apiKey={api_key}&timestamp={timestamp}");
+        let signature = sign(creds.api_secret.expose(), &payload);
+        Ok(serde_json::json!({
+            "apiKey": api_key,
+            "timestamp": timestamp,
+            "signature": signature,
+        }))
     }
 
     /// `params` + `recvWindow` + `timestamp` (server-time adjusted), URL
@@ -233,22 +311,31 @@ fn map_transport(e: reqwest::Error) -> ExchangeError {
 }
 
 async fn decode<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T, ExchangeError> {
+    decode_with_code(resp).await.map_err(|(e, _)| e)
+}
+
+/// As [`decode`], but keeps the Binance error code so the caller can react to
+/// a specific one.
+async fn decode_with_code<T: DeserializeOwned>(
+    resp: reqwest::Response,
+) -> Result<T, (ExchangeError, Option<i64>)> {
     let status = resp.status();
     let retry_after = resp
         .headers()
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
         .map(Duration::from_secs);
-    let body = resp.text().await.map_err(map_transport)?;
+    let body = resp.text().await.map_err(|e| (map_transport(e), None))?;
 
     if status.is_success() {
         return serde_json::from_str(&body).map_err(|e| {
-            ExchangeError::Unknown(format!("decode {status}: {e}; body={body:.200}"))
+            (ExchangeError::Unknown(format!("decode {status}: {e}; body={body:.200}")), None)
         });
     }
 
     let api = serde_json::from_str::<ApiError>(&body).ok();
-    Err(map_status(status, retry_after, api, &body))
+    let code = api.as_ref().map(|a| a.code);
+    Err((map_status(status, retry_after, api, &body), code))
 }
 
 /// HTTP status + Binance error code → `ExchangeError`.
@@ -298,6 +385,27 @@ mod tests {
         assert_eq!(endpoints(Mode::Paper), PROD);
         assert_eq!(endpoints(Mode::Live), PROD);
         assert_eq!(endpoints(Mode::Testnet), TESTNET);
+        assert!(TESTNET.ws_api.contains("testnet"), "a live user stream in testnet mode");
+    }
+
+    #[test]
+    fn ws_api_params_are_signed_over_the_sorted_payload() {
+        let c = BinanceClient::new(Mode::Testnet, Some(creds())).unwrap();
+        let p = c.ws_api_signed_params().unwrap();
+        let api_key = p["apiKey"].as_str().unwrap();
+        let timestamp = p["timestamp"].as_i64().unwrap();
+        assert_eq!(api_key, creds().api_key.expose());
+        assert_eq!(
+            p["signature"].as_str().unwrap(),
+            sign(creds().api_secret.expose(), &format!("apiKey={api_key}&timestamp={timestamp}"))
+        );
+        assert!((timestamp - chrono::Utc::now().timestamp_millis()).abs() < 1_000);
+    }
+
+    #[test]
+    fn ws_api_params_need_credentials() {
+        let c = BinanceClient::new(Mode::Testnet, None).unwrap();
+        assert!(matches!(c.ws_api_signed_params(), Err(ExchangeError::Authentication)));
     }
 
     #[test]
@@ -388,7 +496,8 @@ mod tests {
     #[test]
     fn signed_query_appends_window_timestamp_and_valid_signature() {
         let c = BinanceClient::new(Mode::Testnet, Some(creds())).unwrap();
-        c.set_server_time(chrono::Utc::now().timestamp_millis() + 2_000);
+        let now = chrono::Utc::now().timestamp_millis();
+        c.set_server_time(now + 2_000, now);
         let q = c.signed_query(&[("symbol", "BTCUSDT".into())]).unwrap();
 
         let (payload, sig) = q.rsplit_once("&signature=").expect("signature last");
@@ -420,8 +529,20 @@ mod tests {
     fn server_time_offset_is_recorded() {
         let c = BinanceClient::new(Mode::Paper, None).unwrap();
         assert_eq!(c.time_offset_ms(), 0);
-        c.set_server_time(chrono::Utc::now().timestamp_millis() + 5_000);
+        let now = chrono::Utc::now().timestamp_millis();
+        c.set_server_time(now + 5_000, now);
         assert!((4_500..=5_500).contains(&c.time_offset_ms()));
         assert!(!c.has_credentials());
+    }
+
+    /// A slow reply must not be charged to the offset: the server stamped its
+    /// time mid-flight, so only half the round trip separates it from `sent_at`.
+    #[test]
+    fn the_offset_is_measured_against_the_middle_of_the_round_trip() {
+        let c = BinanceClient::new(Mode::Paper, None).unwrap();
+        // Pretend the request left 400 ms ago and the server is in step with us.
+        let sent_at = chrono::Utc::now().timestamp_millis() - 400;
+        c.set_server_time(sent_at + 200, sent_at);
+        assert!(c.time_offset_ms().abs() <= 50, "offset {} should be ~0", c.time_offset_ms());
     }
 }

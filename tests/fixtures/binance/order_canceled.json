@@ -1,0 +1,17 @@
+{
+  "symbol": "BTCUSDT",
+  "origClientOrderId": "mmppabc123000009",
+  "orderId": 4059123,
+  "orderListId": -1,
+  "clientOrderId": "cancelMyOrder1",
+  "transactTime": 1757606500000,
+  "price": "77000.00000000",
+  "origQty": "0.01000000",
+  "executedQty": "0.00000000",
+  "cummulativeQuoteQty": "0.00000000",
+  "status": "CANCELED",
+  "timeInForce": "GTC",
+  "type": "LIMIT_MAKER",
+  "side": "BUY",
+  "selfTradePreventionMode": "NONE"
+}

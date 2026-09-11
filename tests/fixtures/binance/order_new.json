@@ -1,0 +1,17 @@
+{
+  "symbol": "BTCUSDT",
+  "orderId": 4059123,
+  "orderListId": -1,
+  "clientOrderId": "mmppabc123000009",
+  "transactTime": 1757606400123,
+  "price": "77000.00000000",
+  "origQty": "0.01000000",
+  "executedQty": "0.00000000",
+  "cummulativeQuoteQty": "0.00000000",
+  "status": "NEW",
+  "timeInForce": "GTC",
+  "type": "LIMIT_MAKER",
+  "side": "BUY",
+  "workingTime": 1757606400123,
+  "selfTradePreventionMode": "NONE"
+}
