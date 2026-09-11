@@ -1,19 +1,45 @@
-//! Shared HTTP client: endpoints per mode, server-time offset, error mapping.
-//! Signing is added in M4.
+//! Shared HTTP client: endpoints per mode, server-time offset, error mapping,
+//! HMAC-SHA256 request signing.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use reqwest::StatusCode;
+use hmac::{Hmac, Mac};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::{Method, StatusCode, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use sha2::Sha256;
 use tracing::{debug, warn};
 
 use crate::config::{Credentials, Mode};
 use crate::exchange::ExchangeError;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Binance rejects signed requests whose `timestamp` is older than this
+/// (`-1021`). 5 s is the Binance default; the server-time offset keeps us
+/// well inside it.
+pub const RECV_WINDOW_MS: u64 = 5_000;
+const API_KEY_HEADER: HeaderName = HeaderName::from_static("x-mbx-apikey");
+
+/// Lowercase-hex HMAC-SHA256 of `payload` keyed with the API secret — the
+/// Binance signature scheme (`signature=` over the exact query string).
+pub fn sign(secret: &str, payload: &str) -> String {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key length");
+    mac.update(payload.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// How a request authenticates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Auth {
+    /// `X-MBX-APIKEY` header only (user data stream endpoints).
+    Key,
+    /// Header plus `timestamp`, `recvWindow` and `signature` query params.
+    Signed,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Endpoints {
@@ -105,6 +131,101 @@ impl BinanceClient {
         let resp = self.inner.http.get(&url).query(query).send().await.map_err(map_transport)?;
         decode(resp).await
     }
+
+    /// Signed GET (`USER_DATA` endpoints: open orders, account, order lookup).
+    pub async fn get_signed<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<T, ExchangeError> {
+        self.request(Method::GET, path, params, Auth::Signed).await
+    }
+
+    /// Signed POST (`TRADE` endpoints: place order).
+    pub async fn post_signed<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<T, ExchangeError> {
+        self.request(Method::POST, path, params, Auth::Signed).await
+    }
+
+    /// Signed DELETE (`TRADE` endpoints: cancel order / cancel all).
+    pub async fn delete_signed<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<T, ExchangeError> {
+        self.request(Method::DELETE, path, params, Auth::Signed).await
+    }
+
+    /// API-key-only request without a signature (`USER_STREAM` endpoints:
+    /// listenKey create / keepalive / close).
+    pub async fn request_keyed<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<T, ExchangeError> {
+        self.request(method, path, params, Auth::Key).await
+    }
+
+    async fn request<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        params: &[(&str, String)],
+        auth: Auth,
+    ) -> Result<T, ExchangeError> {
+        let creds = self.inner.credentials.as_ref().ok_or(ExchangeError::Authentication)?;
+        let query = match auth {
+            Auth::Key => encode_query(params),
+            Auth::Signed => self.signed_query(params)?,
+        };
+        // Every parameter travels in the query string for all methods; Binance
+        // accepts that for POST/DELETE and it keeps one signing path. The
+        // query is never logged: it carries the signature.
+        let url = format!("{}{}?{}", self.inner.endpoints.rest, path, query);
+        debug!(%method, path, ?auth, "request");
+
+        let mut headers = HeaderMap::with_capacity(1);
+        headers.insert(
+            API_KEY_HEADER,
+            HeaderValue::from_str(creds.api_key.expose())
+                .map_err(|_| ExchangeError::Authentication)?,
+        );
+        let resp = self
+            .inner
+            .http
+            .request(method, &url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(map_transport)?;
+        decode(resp).await
+    }
+
+    /// `params` + `recvWindow` + `timestamp` (server-time adjusted), URL
+    /// encoded, with `signature` appended over exactly that string.
+    fn signed_query(&self, params: &[(&str, String)]) -> Result<String, ExchangeError> {
+        let creds = self.inner.credentials.as_ref().ok_or(ExchangeError::Authentication)?;
+        let timestamp = chrono::Utc::now().timestamp_millis() + self.time_offset_ms();
+        let mut all: Vec<(&str, String)> = Vec::with_capacity(params.len() + 2);
+        all.extend(params.iter().map(|(k, v)| (*k, v.clone())));
+        all.push(("recvWindow", RECV_WINDOW_MS.to_string()));
+        all.push(("timestamp", timestamp.to_string()));
+        let query = encode_query(&all);
+        let signature = sign(creds.api_secret.expose(), &query);
+        Ok(format!("{query}&signature={signature}"))
+    }
+}
+
+/// `application/x-www-form-urlencoded` query string, parameter order preserved
+/// (the signature is over the bytes as sent, so encoding and order must match).
+fn encode_query(params: &[(&str, String)]) -> String {
+    let mut url = Url::parse("https://x").expect("static url");
+    url.query_pairs_mut().extend_pairs(params.iter().map(|(k, v)| (*k, v.as_str())));
+    url.query().unwrap_or_default().to_owned()
 }
 
 fn map_transport(e: reqwest::Error) -> ExchangeError {
@@ -170,6 +291,7 @@ pub fn map_api_code(code: i64, msg: String) -> ExchangeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Secret;
 
     #[test]
     fn endpoints_follow_mode_not_credentials() {
@@ -226,6 +348,72 @@ mod tests {
             "",
         );
         assert!(matches!(e, ExchangeError::InvalidOrder(m) if m.contains("Invalid symbol")));
+    }
+
+    fn creds() -> Credentials {
+        Credentials {
+            api_key: Secret::new(
+                "vmPUZE6mv9SD5VNHk4HlWFsOr6aKE2zvsw0MuIgwCIPy6utIco14y7Ju91duEh8A",
+            ),
+            api_secret: Secret::new(
+                "NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j",
+            ),
+            passphrase: None,
+        }
+    }
+
+    /// Reference vector from the Binance spot API docs ("Example 1: as a
+    /// query string").
+    #[test]
+    fn signature_matches_binance_reference_vector() {
+        let query = "symbol=LTCBTC&side=BUY&type=LIMIT&timeInForce=GTC&quantity=1&price=0.1\
+                     &recvWindow=5000&timestamp=1499827319559";
+        assert_eq!(
+            sign(creds().api_secret.expose(), query),
+            "c8db56825ae71d6d79447849e617115f4a920fa2acdcab2b053c4b2838bd6b71"
+        );
+    }
+
+    #[test]
+    fn query_encoding_preserves_order_and_escapes() {
+        let q = encode_query(&[
+            ("symbol", "BTCUSDT".into()),
+            ("price", "0.1".into()),
+            ("origClientOrderId", "a b&c".into()),
+        ]);
+        assert_eq!(q, "symbol=BTCUSDT&price=0.1&origClientOrderId=a+b%26c");
+        assert_eq!(encode_query(&[]), "");
+    }
+
+    #[test]
+    fn signed_query_appends_window_timestamp_and_valid_signature() {
+        let c = BinanceClient::new(Mode::Testnet, Some(creds())).unwrap();
+        c.set_server_time(chrono::Utc::now().timestamp_millis() + 2_000);
+        let q = c.signed_query(&[("symbol", "BTCUSDT".into())]).unwrap();
+
+        let (payload, sig) = q.rsplit_once("&signature=").expect("signature last");
+        assert_eq!(sig.len(), 64);
+        assert!(sig.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(sig, sign(creds().api_secret.expose(), payload));
+
+        assert!(payload.starts_with("symbol=BTCUSDT&recvWindow=5000&timestamp="));
+        let ts: i64 = payload.rsplit_once('=').unwrap().1.parse().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!((ts - now - 2_000).abs() < 1_000, "timestamp carries the server offset");
+    }
+
+    #[test]
+    fn signed_requests_need_credentials() {
+        let c = BinanceClient::new(Mode::Testnet, None).unwrap();
+        assert!(matches!(c.signed_query(&[]), Err(ExchangeError::Authentication)));
+    }
+
+    #[tokio::test]
+    async fn keyed_request_without_credentials_fails_before_the_network() {
+        let c = BinanceClient::new(Mode::Testnet, None).unwrap();
+        let r: Result<serde_json::Value, _> =
+            c.request_keyed(Method::POST, "/api/v3/userDataStream", &[]).await;
+        assert!(matches!(r, Err(ExchangeError::Authentication)));
     }
 
     #[test]
