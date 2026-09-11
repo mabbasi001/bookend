@@ -6,6 +6,6 @@ data/
 .git/
 .gitignore
 *.md
-!readme.md
+local/
 .vscode/
 .idea/

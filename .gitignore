@@ -4,3 +4,6 @@
 .env.*
 !.env.example
 /configs/live.toml
+
+# Local-only docs and task board (not part of the repo)
+/local/
