@@ -3,4 +3,4 @@
 pub mod manager;
 pub mod state;
 
-pub use manager::{ClientIdGen, OrderManager, Plan};
+pub use manager::{ClientIdGen, OrderManager, Placement, Plan};

@@ -76,10 +76,17 @@ fn base36(mut n: u64, width: usize) -> String {
 // Plan
 // ---------------------------------------------------------------------------
 
+/// A placement, routed to the venue whose book produced the quote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    pub exchange: ExchangeId,
+    pub request: OrderRequest,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Plan {
     pub cancel: Vec<Order>,
-    pub place: Vec<OrderRequest>,
+    pub place: Vec<Placement>,
 }
 
 impl Plan {
@@ -187,14 +194,17 @@ impl OrderManager {
                 debug!(exchange = %w.exchange, side = %w.side, "order in flight; not placing another");
                 continue;
             }
-            plan.place.push(OrderRequest {
-                symbol: self.symbol.clone(),
-                side: w.side,
-                order_type: OrderType::Limit,
-                price: Some(w.price),
-                quantity: w.quantity,
-                client_order_id: self.ids.next(w.exchange),
-                post_only: self.post_only,
+            plan.place.push(Placement {
+                exchange: w.exchange,
+                request: OrderRequest {
+                    symbol: self.symbol.clone(),
+                    side: w.side,
+                    order_type: OrderType::Limit,
+                    price: Some(w.price),
+                    quantity: w.quantity,
+                    client_order_id: self.ids.next(w.exchange),
+                    post_only: self.post_only,
+                },
             });
         }
         plan
@@ -381,9 +391,9 @@ mod tests {
 
     /// Place everything in the plan and acknowledge it as Open.
     fn place_all(m: &mut OrderManager, plan: &Plan) {
-        for r in &plan.place {
-            m.on_submitting(ExchangeId::Paper, r);
-            m.on_placed(&ack(r, OrderStatus::Open));
+        for p in &plan.place {
+            m.on_submitting(p.exchange, &p.request);
+            m.on_placed(&ack(&p.request, OrderStatus::Open));
         }
     }
 
@@ -408,9 +418,11 @@ mod tests {
         let plan = m.plan(&[quote("0.997", "1.007", "1000")]);
         assert!(plan.cancel.is_empty());
         assert_eq!(plan.place.len(), 2);
-        assert_eq!(plan.place[0].side, Side::Buy);
-        assert_eq!(plan.place[0].price, Some(d("0.997")));
-        assert!(plan.place.iter().all(|r| r.post_only && r.order_type == OrderType::Limit));
+        assert_eq!(plan.place[0].request.side, Side::Buy);
+        assert_eq!(plan.place[0].request.price, Some(d("0.997")));
+        assert!(plan.place.iter().all(|p| p.request.post_only
+            && p.request.order_type == OrderType::Limit
+            && p.exchange == ExchangeId::Paper));
     }
 
     #[test]
@@ -431,7 +443,7 @@ mod tests {
         assert_eq!(plan.cancel.len(), 1);
         assert_eq!(plan.cancel[0].side, Side::Buy);
         assert_eq!(plan.place.len(), 1);
-        assert_eq!(plan.place[0].price, Some(d("0.998")));
+        assert_eq!(plan.place[0].request.price, Some(d("0.998")));
     }
 
     #[test]
@@ -449,10 +461,10 @@ mod tests {
     fn in_flight_side_is_not_placed_twice() {
         let mut m = manager();
         let plan = m.plan(&[quote("0.997", "1.007", "1000")]);
-        m.on_submitting(ExchangeId::Paper, &plan.place[0]); // bid submitting, no ack yet
+        m.on_submitting(ExchangeId::Paper, &plan.place[0].request); // bid submitting, no ack yet
         let again = m.plan(&[quote("0.997", "1.007", "1000")]);
         assert_eq!(again.place.len(), 1, "only the ask");
-        assert_eq!(again.place[0].side, Side::Sell);
+        assert_eq!(again.place[0].request.side, Side::Sell);
         assert!(again.cancel.is_empty());
     }
 
@@ -460,13 +472,19 @@ mod tests {
     fn uncertain_failure_keeps_order_as_unknown_definite_failure_drops_it() {
         let mut m = manager();
         let plan = m.plan(&[quote("0.997", "1.007", "1000")]);
-        m.on_submitting(ExchangeId::Paper, &plan.place[0]);
-        m.on_place_failed(&plan.place[0].client_order_id, &ExchangeError::Timeout);
-        assert_eq!(m.get(&plan.place[0].client_order_id).unwrap().status, OrderStatus::Unknown);
+        m.on_submitting(ExchangeId::Paper, &plan.place[0].request);
+        m.on_place_failed(&plan.place[0].request.client_order_id, &ExchangeError::Timeout);
+        assert_eq!(
+            m.get(&plan.place[0].request.client_order_id).unwrap().status,
+            OrderStatus::Unknown
+        );
 
-        m.on_submitting(ExchangeId::Paper, &plan.place[1]);
-        m.on_place_failed(&plan.place[1].client_order_id, &ExchangeError::InvalidOrder("x".into()));
-        assert!(m.get(&plan.place[1].client_order_id).is_none());
+        m.on_submitting(ExchangeId::Paper, &plan.place[1].request);
+        m.on_place_failed(
+            &plan.place[1].request.client_order_id,
+            &ExchangeError::InvalidOrder("x".into()),
+        );
+        assert!(m.get(&plan.place[1].request.client_order_id).is_none());
     }
 
     #[test]
@@ -474,7 +492,7 @@ mod tests {
         let mut m = manager();
         let plan = m.plan(&[quote("0.997", "1.007", "1000")]);
         place_all(&mut m, &plan);
-        let id = plan.place[0].client_order_id.clone();
+        let id = plan.place[0].request.client_order_id.clone();
         m.on_cancel_requested(&id);
         // Re-planning the same quote must not cancel it again nor place a duplicate bid
         // (the bid side is still "live", just not matchable).
@@ -482,7 +500,7 @@ mod tests {
         assert!(again.cancel.is_empty());
         assert_eq!(again.place.len(), 1, "a fresh bid replaces the cancelling one");
 
-        let mut done = ack(&plan.place[0], OrderStatus::Cancelled);
+        let mut done = ack(&plan.place[0].request, OrderStatus::Cancelled);
         done.client_order_id = id.clone();
         assert!(m.on_order_update(&done).is_some());
         assert!(m.get(&id).is_none());
@@ -493,7 +511,7 @@ mod tests {
         let mut m = manager();
         let plan = m.plan(&[quote("0.997", "1.007", "1000")]);
         place_all(&mut m, &plan);
-        let id = plan.place[0].client_order_id.clone();
+        let id = plan.place[0].request.client_order_id.clone();
         m.on_cancel_requested(&id);
         m.on_cancel_failed(&id, &ExchangeError::OrderNotFound);
         assert!(m.get(&id).is_none());
@@ -504,7 +522,7 @@ mod tests {
         let mut m = manager();
         let plan = m.plan(&[quote("0.997", "1.007", "1000")]);
         place_all(&mut m, &plan);
-        let id = plan.place[0].client_order_id.clone();
+        let id = plan.place[0].request.client_order_id.clone();
         m.on_cancel_requested(&id);
         m.on_cancel_failed(&id, &ExchangeError::Timeout);
         assert_eq!(m.get(&id).unwrap().status, OrderStatus::Open);
@@ -516,8 +534,8 @@ mod tests {
         let mut m = manager();
         let plan = m.plan(&[quote("0.997", "1.007", "1000")]);
         place_all(&mut m, &plan);
-        let id = plan.place[0].client_order_id.clone();
-        let mut partial = ack(&plan.place[0], OrderStatus::PartiallyFilled);
+        let id = plan.place[0].request.client_order_id.clone();
+        let mut partial = ack(&plan.place[0].request, OrderStatus::PartiallyFilled);
         partial.filled_quantity = d("400");
         m.on_order_update(&partial).unwrap();
         assert_eq!(m.get(&id).unwrap().remaining_quantity(), d("600"));
@@ -536,11 +554,11 @@ mod tests {
         let mut m = manager();
         let plan = m.plan(&[quote("0.997", "1.007", "1000")]);
         place_all(&mut m, &plan);
-        let mut foreign = ack(&plan.place[0], OrderStatus::Open);
+        let mut foreign = ack(&plan.place[0].request, OrderStatus::Open);
         foreign.client_order_id = "someone-else".into();
         assert!(m.on_order_update(&foreign).is_none());
         assert_eq!(m.orders().count(), 2);
-        let stale = ack(&plan.place[0], OrderStatus::Submitting);
+        let stale = ack(&plan.place[0].request, OrderStatus::Submitting);
         assert!(m.on_order_update(&stale).is_none());
     }
 
